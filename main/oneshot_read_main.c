@@ -19,13 +19,16 @@
 #include "esp_http_server.h"
 #include "nvs_flash.h"
 
-const static char *TAG = "EXAMPLE";
+const static char *TAG = "PLURA-ADC-READ";
 
 /*---------------------------------------------------------------
         ADC General Macros
 ---------------------------------------------------------------*/
 // ADC2 Channels
-#define BATTERY_CHANNEL ADC_CHANNEL_3
+#define V_BAT ADC_CHANNEL_3
+#define FC_TEMP ADC_CHANNEL_4
+#define MPC_TEMP ADC_CHANNEL_5
+
 #define ADC_ATTEN ADC_ATTEN_DB_12
 
 // WiFi AP configuration
@@ -34,10 +37,12 @@ const static char *TAG = "EXAMPLE";
 #define AP_CHANNEL 1
 #define MAX_STA_CONN 4
 
-static int adc_raw[1][10];
-static int voltage[1][10];
-static int latest_voltage = 0;
-static int latest_raw = 0;
+static int adc_raw[3][10];
+static int voltage[3][10];
+static int latest_voltage = 0;  // V_BAT calibrated
+static int latest_raw_vbat = 0; // V_BAT raw
+static int latest_raw_fc = 0;   // FC_TEMP raw
+static int latest_raw_mpc = 0;  // MPC_TEMP raw
 
 // ADC related
 static adc_oneshot_unit_handle_t adc2_handle;
@@ -97,11 +102,13 @@ void app_main(void)
     };
     ESP_ERROR_CHECK(adc_oneshot_new_unit(&init_config2, &adc2_handle));
 
-    do_calibration2 = example_adc_calibration_init(ADC_UNIT_2, BATTERY_CHANNEL, ADC_ATTEN, &adc2_cali_handle);
-    ESP_ERROR_CHECK(adc_oneshot_config_channel(adc2_handle, BATTERY_CHANNEL, &config));
+    do_calibration2 = example_adc_calibration_init(ADC_UNIT_2, V_BAT, ADC_ATTEN, &adc2_cali_handle);
+    ESP_ERROR_CHECK(adc_oneshot_config_channel(adc2_handle, V_BAT, &config));
+    ESP_ERROR_CHECK(adc_oneshot_config_channel(adc2_handle, FC_TEMP, &config));
+    ESP_ERROR_CHECK(adc_oneshot_config_channel(adc2_handle, MPC_TEMP, &config));
 
     // Start ADC reading task
-    xTaskCreate(adc_read_task, "adc_read_task", 2048, NULL, 5, NULL);
+    xTaskCreate(adc_read_task, "adc_read_task", 4096, NULL, 5, NULL);
 
     // Start HTTP server
     httpd_config_t config_http = HTTPD_DEFAULT_CONFIG();
@@ -139,17 +146,29 @@ static void adc_read_task(void *arg)
 {
     while (1)
     {
-        ESP_ERROR_CHECK(adc_oneshot_read(adc2_handle, BATTERY_CHANNEL, &adc_raw[0][0]));
-        latest_raw = adc_raw[0][0];
-        ESP_LOGI(TAG, "ADC%d Channel[%d] Raw Data: %d", ADC_UNIT_2 + 1, BATTERY_CHANNEL, adc_raw[0][0]);
+        // Read V_BAT (Battery Voltage)
+        ESP_ERROR_CHECK(adc_oneshot_read(adc2_handle, V_BAT, &adc_raw[0][0]));
+        latest_raw_vbat = adc_raw[0][0];
+        ESP_LOGI(TAG, "ADC%d Channel[%d] V_BAT Raw Data: %d", ADC_UNIT_2 + 1, V_BAT, adc_raw[0][0]);
 
         if (do_calibration2)
         {
             ESP_ERROR_CHECK(adc_cali_raw_to_voltage(adc2_cali_handle, adc_raw[0][0], &voltage[0][0]));
             latest_voltage = voltage[0][0] * 2;        // Multiply by 2
             float voltage_v = latest_voltage / 1000.0; // Convert to volts
-            ESP_LOGI(TAG, "ADC%d Channel[%d] Cali Voltage: %.2f V", ADC_UNIT_2 + 1, BATTERY_CHANNEL, voltage_v);
+            ESP_LOGI(TAG, "ADC%d Channel[%d] V_BAT Cali Voltage: %.2f V", ADC_UNIT_2 + 1, V_BAT, voltage_v);
         }
+
+        // Read FC_TEMP (Fuel Cell Temperature)
+        ESP_ERROR_CHECK(adc_oneshot_read(adc2_handle, FC_TEMP, &adc_raw[1][0]));
+        latest_raw_fc = adc_raw[1][0];
+        ESP_LOGI(TAG, "ADC%d Channel[%d] FC_TEMP Raw Data: %d", ADC_UNIT_2 + 1, FC_TEMP, adc_raw[1][0]);
+
+        // Read MPC_TEMP (MPC Temperature)
+        ESP_ERROR_CHECK(adc_oneshot_read(adc2_handle, MPC_TEMP, &adc_raw[2][0]));
+        latest_raw_mpc = adc_raw[2][0];
+        ESP_LOGI(TAG, "ADC%d Channel[%d] MPC_TEMP Raw Data: %d", ADC_UNIT_2 + 1, MPC_TEMP, adc_raw[2][0]);
+
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
 }
@@ -162,25 +181,38 @@ static esp_err_t root_handler(httpd_req_t *req)
     const char *html_page = "<!DOCTYPE html>"
                             "<html>"
                             "<head>"
-                            "<title>ESP32 ADC Monitor</title>"
+                            "<title>ESP32 System Monitor</title>"
                             "<meta charset=\"UTF-8\">"
                             "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">"
                             "<style>"
                             "body { font-family: Arial, sans-serif; margin: 0; padding: 20px; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); min-height: 100vh; display: flex; justify-content: center; align-items: center; }"
-                            ".container { background: white; border-radius: 10px; padding: 30px; box-shadow: 0 10px 25px rgba(0,0,0,0.2); text-align: center; max-width: 400px; }"
-                            "h1 { color: #333; margin-top: 0; }"
-                            ".reading { font-size: 48px; font-weight: bold; color: #667eea; margin: 20px 0; }"
-                            ".label { color: #666; font-size: 14px; margin-bottom: 10px; }"
-                            ".raw { font-size: 18px; color: #999; margin-top: 20px; }"
+                            ".container { background: white; border-radius: 10px; padding: 30px; box-shadow: 0 10px 25px rgba(0,0,0,0.2); text-align: center; max-width: 500px; }"
+                            "h1 { color: #333; margin-top: 0; margin-bottom: 30px; }"
+                            ".reading-group { background: #f8f9fa; border-radius: 8px; padding: 20px; margin-bottom: 20px; }"
+                            ".reading-label { color: #666; font-size: 14px; margin-bottom: 8px; font-weight: 500; }"
+                            ".reading-value { font-size: 36px; font-weight: bold; color: #667eea; margin: 10px 0; }"
+                            ".reading-raw { font-size: 12px; color: #999; margin-top: 8px; }"
                             ".status { color: #27ae60; font-size: 12px; margin-top: 20px; }"
                             "</style>"
                             "</head>"
                             "<body>"
                             "<div class=\"container\">"
-                            "<h1>Battery Voltage Monitor</h1>"
-                            "<div class=\"label\">Current Voltage</div>"
-                            "<div class=\"reading\" id=\"voltage\">-- V</div>"
-                            "<div class=\"raw\">Raw ADC: <span id=\"raw\">--</span></div>"
+                            "<h1>Battery Voltage</h1>"
+                            "<div class=\"reading-group\">"
+                            "<div class=\"reading-label\">Battery Voltage</div>"
+                            "<div class=\"reading-value\" id=\"voltage\">-- V</div>"
+                            "<div class=\"reading-raw\">Raw: <span id=\"raw-vbat\">--</span></div>"
+                            "</div>"
+                            "<div class=\"reading-group\">"
+                            "<div class=\"reading-label\">FC Temperature</div>"
+                            "<div class=\"reading-value\" id=\"fc-temp\">-- mV</div>"
+                            "<div class=\"reading-raw\">Raw ADC: <span id=\"raw-fc\">--</span></div>"
+                            "</div>"
+                            "<div class=\"reading-group\">"
+                            "<div class=\"reading-label\">MPC Temperature</div>"
+                            "<div class=\"reading-value\" id=\"mpc-temp\">-- mV</div>"
+                            "<div class=\"reading-raw\">Raw ADC: <span id=\"raw-mpc\">--</span></div>"
+                            "</div>"
                             "<div class=\"status\">Auto-updating every 1 second</div>"
                             "</div>"
                             "<script>"
@@ -189,7 +221,11 @@ static esp_err_t root_handler(httpd_req_t *req)
                             "    .then(response => response.json())"
                             "    .then(data => {"
                             "      document.getElementById('voltage').textContent = (data.voltage / 1000).toFixed(2) + ' V';"
-                            "      document.getElementById('raw').textContent = data.raw;"
+                            "      document.getElementById('raw-vbat').textContent = data.raw_vbat;"
+                            "      document.getElementById('fc-temp').textContent = data.raw_fc + ' mV';"
+                            "      document.getElementById('raw-fc').textContent = data.raw_fc;"
+                            "      document.getElementById('mpc-temp').textContent = data.raw_mpc + ' mV';"
+                            "      document.getElementById('raw-mpc').textContent = data.raw_mpc;"
                             "    })"
                             "    .catch(error => console.error('Error:', error));"
                             "}"
@@ -209,8 +245,10 @@ static esp_err_t root_handler(httpd_req_t *req)
 ---------------------------------------------------------------*/
 static esp_err_t api_voltage_handler(httpd_req_t *req)
 {
-    char json_response[100];
-    snprintf(json_response, sizeof(json_response), "{\"voltage\":%d,\"raw\":%d}", latest_voltage, latest_raw);
+    char json_response[200];
+    snprintf(json_response, sizeof(json_response),
+             "{\"voltage\":%d,\"raw_vbat\":%d,\"raw_fc\":%d,\"raw_mpc\":%d}",
+             latest_voltage, latest_raw_vbat, latest_raw_fc, latest_raw_mpc);
 
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, json_response, strlen(json_response));
