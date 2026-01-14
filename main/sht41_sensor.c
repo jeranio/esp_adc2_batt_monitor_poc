@@ -23,8 +23,14 @@ esp_err_t i2c_master_init(void)
         .glitch_ignore_cnt = 7,
     };
 
-    ESP_ERROR_CHECK(i2c_new_master_bus(&i2c_mst_config, &bus_handle));
-    ESP_LOGI(TAG, "I2C master bus initialized");
+    esp_err_t ret = i2c_new_master_bus(&i2c_mst_config, &bus_handle);
+    if (ret != ESP_OK)
+    {
+        ESP_LOGE(TAG, "Failed to initialize I2C bus: %s", esp_err_to_name(ret));
+        return ret;
+    }
+    ESP_LOGI(TAG, "I2C master bus initialized on port %d (SCL=%d, SDA=%d)",
+             I2C_MASTER_NUM, I2C_MASTER_SCL_IO, I2C_MASTER_SDA_IO);
 
     // Add SHT41 device to bus once during initialization
     i2c_device_config_t dev_cfg = {
@@ -33,8 +39,28 @@ esp_err_t i2c_master_init(void)
         .scl_speed_hz = I2C_MASTER_FREQ_HZ,
     };
 
-    ESP_ERROR_CHECK(i2c_master_bus_add_device(bus_handle, &dev_cfg, &sht41_dev_handle));
-    ESP_LOGI(TAG, "SHT41 device added to I2C bus");
+    ret = i2c_master_bus_add_device(bus_handle, &dev_cfg, &sht41_dev_handle);
+    if (ret != ESP_OK)
+    {
+        ESP_LOGE(TAG, "Failed to add SHT41 device (addr=0x%02X) to bus: %s",
+                 SHT41_ADDR, esp_err_to_name(ret));
+        return ret;
+    }
+    ESP_LOGI(TAG, "SHT41 device added to I2C bus at address 0x%02X", SHT41_ADDR);
+
+    // Probe device with a simple read to verify it's responding
+    vTaskDelay(pdMS_TO_TICKS(100));
+    uint8_t probe_buf[1] = {0};
+    ret = i2c_master_receive(sht41_dev_handle, probe_buf, 1, -1);
+    if (ret != ESP_OK)
+    {
+        ESP_LOGW(TAG, "SHT41 device not responding on probe (expected on cold start): %s",
+                 esp_err_to_name(ret));
+    }
+    else
+    {
+        ESP_LOGI(TAG, "SHT41 device probe successful");
+    }
 
     return ESP_OK;
 }
@@ -61,16 +87,35 @@ esp_err_t sht41_read_sensor(float *temperature, float *humidity)
         return ret;
     }
 
-    // Wait for measurement to complete (~10ms)
-    vTaskDelay(pdMS_TO_TICKS(15));
+    // Wait for measurement to complete (SHT41 needs ~10ms, use 20ms for safety)
+    vTaskDelay(pdMS_TO_TICKS(20));
 
     // Read 6 bytes (temp_MSB, temp_LSB, temp_CRC, humidity_MSB, humidity_LSB, humidity_CRC)
     ret = i2c_master_receive(sht41_dev_handle, read_buf, sizeof(read_buf), -1);
     if (ret != ESP_OK)
     {
-        ESP_LOGE(TAG, "Failed to read from SHT41: %s", esp_err_to_name(ret));
-        return ret;
+        ESP_LOGE(TAG, "Failed to read from SHT41: %s (error code: 0x%X)", esp_err_to_name(ret), ret);
+
+        // Try to recover by re-initializing the device
+        static int retry_count = 0;
+        if (retry_count < 3)
+        {
+            retry_count++;
+            ESP_LOGI(TAG, "Attempting to recover SHT41 connection (attempt %d/3)", retry_count);
+            vTaskDelay(pdMS_TO_TICKS(100));
+            return ret;
+        }
+        else
+        {
+            ESP_LOGE(TAG, "SHT41 recovery failed, giving up");
+            retry_count = 0;
+            return ret;
+        }
     }
+
+    // Reset retry counter on success
+    static int retry_count = 0;
+    retry_count = 0;
 
     // Convert raw values to temperature and humidity
     uint16_t temp_raw = (read_buf[0] << 8) | read_buf[1];
